@@ -1,0 +1,199 @@
+#! /usr/bin/env perl
+
+use strict;
+use v5.10;
+
+use LWP::Simple;
+use Git::Repository;
+use File::Path qw(rmtree);
+use Cwd qw(cwd);
+use Git::Repository;
+
+use constant UNZIP => 'unzip' || $ENV{UNZIP};
+
+use constant STRAWBERRY_VERSION => '5.32.1.1';
+use constant STRAWBERRY_64BIT_ZIPNAME => 'strawberry-perl-'
+	. STRAWBERRY_VERSION
+	. '-64bit-portable.zip';
+use constant STRAWBERRY_32BIT_ZIPNAME => 'strawberry-perl-'
+	. STRAWBERRY_VERSION
+	. '-32bit-portable.zip';
+use constant STRAWBERY_64BIT_LINK => 'https://strawberryperl.com/download/'
+	. STRAWBERRY_VERSION . '/'
+	. STRAWBERRY_64BIT_ZIPNAME;
+use constant STRAWBERY_32BIT_LINK => 'https://strawberryperl.com/download/'
+	. STRAWBERRY_VERSION . '/'
+	. STRAWBERRY_32BIT_ZIPNAME;
+
+autoflush STDOUT, 1;
+autoflush STDERR, 1;
+
+my ($qgoda_version) = (@ARGV) or die "Usage: $0 QGODA_VERSION\n";
+
+sub download;
+sub clone;
+sub build;
+sub build_bitness;
+sub build_from_git;
+sub write_config;
+
+my $here = cwd;
+
+download;
+build 64;
+build 32;
+
+sub download {
+	my $zip64 = STRAWBERRY_64BIT_ZIPNAME;
+	if (!-e $zip64) {
+		print "Downloading ", STRAWBERY_64BIT_LINK, " ...";
+		my $code = getstore STRAWBERY_64BIT_LINK, $zip64;
+		if ($code != 200) {
+			die STRAWBERY_64BIT_LINK, ": $code";
+		}
+		print " done\n";
+	} else {
+		say "$zip64 already downloaded";
+	}
+
+	my $zip32 = STRAWBERRY_32BIT_ZIPNAME;
+	if (!-e $zip32) {
+		print "Downloading ", STRAWBERY_32BIT_LINK, " ... ";
+		my $code = getstore STRAWBERY_32BIT_LINK, $zip32;
+		if ($code != 200) {
+			die STRAWBERY_32BIT_LINK, ": $code";
+		}
+		print "done\n";
+	} else {
+		say "$zip32 already downloaded";
+	}
+}
+
+sub build {
+	my ($bitness) = @_;
+
+	print <<"EOF";
+
+Building $bitness Bit Version
+=======================
+EOF
+
+	my $builddir = $here . '/build';
+	if (-e $builddir) {
+		chdir $here;
+		print "cleaning up stale build ... ";
+		rmtree $builddir or die "cannot rm -rf 'builddir': $!";
+		print "done\n";
+	}
+
+	mkdir $builddir or die "cannot mkdir '$builddir': $!";
+	chdir $builddir or die "cannot chdir to '$builddir': $!";
+
+	my %all_files = (
+		64 => {
+			builddir => $builddir,
+			zip => "$here/" . STRAWBERRY_64BIT_ZIPNAME,
+			bitness => 64,
+		},
+		32 => {
+			builddir => $builddir,
+			zip => "$here/" . STRAWBERRY_32BIT_ZIPNAME,
+			bitness => 32,
+		},
+	);
+
+	build_bitness $all_files{$bitness};
+}
+
+sub build_bitness {
+	my ($buildinfo) = @_;
+
+	my $builddir = $buildinfo->{builddir};
+
+	my $zip = $buildinfo->{zip};
+	my $strawberry_dir = $builddir . '/strawberry';
+
+	print "unzip $zip ... ";
+	if (0 != system UNZIP, '-q', $zip, '-d', $strawberry_dir) {
+		if ($? == -1) {
+			die "execute '@{[UNZIP]}' failed: $!";
+		} else {
+			exit 1;
+		}
+	}
+	print "done\n";
+
+	chdir $here or die "cannot chdir to '$here': $!";
+
+	my @git_installs = (
+		{
+			name => 'AnyEvent-Filesys-Watcher',
+			tag => 'main',
+			repo => 'https://github.com/gflohr/AnyEvent-Filesys-Watcher',
+		},
+		{
+			name => 'JavaScript::Duktape::XS',
+			tag => '793f606',
+			repo => 'https://github.com/gonzus/JavaScript-Duktape-XS',
+		},
+		{
+			name => 'Qgoda',
+			tag => $qgoda_version,
+			repo => 'https://github.com/gflohr/Qgoda',
+		},
+	);
+
+	foreach my $git_install (@git_installs) {
+		build_from_git $builddir, $strawberry_dir, $git_install;
+	}
+
+	write_config $buildinfo;
+
+	chdir $here;
+	print "cleaning up ... ";
+	rmtree $builddir or die "cannot rm -rf 'builddir': $!";
+	print "done\n";
+}
+
+sub write_config {
+	my ($buildinfo) = @_;
+
+	my $config_iss = $buildinfo->{builddir} . '/config.iss';
+	open my $fh, '>', $config_iss
+		or die "cannot open '$config_iss' for writing: $!";
+	$fh->print(<<"EOF") or die "cannot write to '$config_iss': $!";
+#define APP_VERSION '$qgoda_version'
+#define BITNESS '$buildinfo->{bitness}'
+EOF
+}
+
+sub build_from_git {
+	my ($builddir, $strawberry_dir, $gitinfo) = @_;
+
+	say "building $gitinfo->{name} from git";
+
+	chdir $builddir or die "cannot cd to '$builddir': $!";
+	my $output = Git::Repository->run(clone => $gitinfo->{repo}, $gitinfo->{name},
+		{ quiet => 1 });
+	my $repo = Git::Repository->new(work_tree => $gitinfo->{name});
+	$output = $repo->run(checkout => $gitinfo->{tag}, { quiet => 1 });
+
+	# my $cpanm = "$strawberry_dir/perl/bin/cpanm.bat";
+	my $cpanm = 'cpanm';
+
+	chdir $gitinfo->{name} or die "cannot cd to '$gitinfo->{name}': $!";
+	my @args = (
+		'--notest',
+		'--quiet',
+		'--local-lib',
+		"$strawberry_dir/perl/site",
+		'.'
+	);
+	if (0 != system $cpanm, @args) {
+		if ($? == -1) {
+			die "execute '$cpanm' failed: $!";
+		} else {
+			exit 1;
+		}
+	}
+}
